@@ -1,1 +1,24 @@
-theme: jekyll-theme-leap-day
+title: Weaver of types #TODO Better name
+description: >-
+  I'm a Scala witch that spins spells of magic to further my crazy ideas of abstraction and elegance. 
+  My weapons of choice are for the most part typelevel programming, logic programming, and some occasional typelevel FP. 
+  If it can be abused, I will abuse it. :P
+github_username:  Katrix
+
+# Build settings
+markdown: kramdown
+theme: minima
+plugins:
+  - jekyll-feed
+
+# Exclude from processing.
+# The following items will not be processed, by default. Create a custom list
+# to override the default setting.
+# exclude:
+#   - Gemfile
+#   - Gemfile.lock
+#   - node_modules
+#   - vendor/bundle/
+#   - vendor/cache/
+#   - vendor/gems/
+#   - vendor/ruby/
