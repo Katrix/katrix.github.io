@@ -1,0 +1,13 @@
+{% capture scala-code %}
+{% highlight scala %}
+{{ include.scala }}
+{% endhighlight %}
+{% endcapture %}
+
+{% capture dotty-code %}
+{% highlight scala %}
+{{ include.dotty }}
+{% endhighlight %}
+{% endcapture %}
+
+{% include code_blocks.html scala=scala-code dotty=dotty-code id=include.id %}

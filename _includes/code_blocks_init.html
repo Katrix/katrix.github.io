@@ -3,10 +3,12 @@
 		let tabs = $('.multicodeblocks a.nav-link[data-code-language="' + lang + '"]');
 		tabs.on('click', e => {
 			e.preventDefault();
-			tabs.tab('show')
+			tabs.tab('show');
+			e.target.scrollIntoView();
 		});
 		return tabs;
 	}
+	
 	document.addEventListener('DOMContentLoaded', e => {
 		setupLangTags('scala').tab('show');
 		setupLangTags('dotty');
