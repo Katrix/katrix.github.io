@@ -129,7 +129,7 @@ Look back at the boilerplate mountain. We wrote two case classes, with the same 
 case class ProjectF[F[_]](
   name: F[String],
   description: F[String],
-  /* Note that I don't wrap this in F, as it's content will be wrapped in F instead */
+  // Note that I don't wrap this in F, as it's content will be wrapped in F instead
   settings: ProjectSettings[F]
 )
 
@@ -156,11 +156,9 @@ type Project = ProjectF[Id]
 
 There is one more important type and instance we need, `Const`. (When the Scala and Dotty representation of a concept differs substantially, I'll include both.)
 {% capture scala-const %}
-/*
-Here we're defining a partially applied type. We use it like so 
-Const[String]#λ[Int], or if we're in a place expecting a higher kinded 
-type, just Const[String]#λ
-*/
+// Here we're defining a partially applied type. We use it like so 
+// Const[String]#λ[Int], or if we're in a place expecting a higher kinded 
+// type, just Const[String]#λ
 type Const[A] = {
   type λ[B] = A
 }
@@ -176,19 +174,19 @@ It is, in some ways, opposite to how `Id` works. While `Id` spits back what we t
 {% capture scala-const-usage %}
 type Name[A] = Const[String]#λ[A]
 
-type Foo = Name[Int] /* Type of Foo is String */
-type Bar = Name[String] /* Type of Bar is String */
-type Baz = Name[Option[List[Double]]] /* Type of Baz is String */
-type Bin = Name[Nothing] /* Type of Bin is String */
+type Foo = Name[Int] // Type of Foo is String
+type Bar = Name[String] // Type of Bar is String
+type Baz = Name[Option[List[Double]]] // Type of Baz is String
+type Bin = Name[Nothing] // Type of Bin is String
 {% endcapture %}
 
 {% capture dotty-const-usage %}
 type Name[A] = Const[String][A]
 
-type Foo = Name[Int] /* Type of Foo is String */
-type Bar = Name[String] /* Type of Bar is String */
-type Baz = Name[Option[List[Double]]] /* Type of Baz is String */
-type Bin = Name[Nothing] /* Type of Bin is String */
+type Foo = Name[Int] // Type of Foo is String
+type Bar = Name[String] // Type of Bar is String
+type Baz = Name[Option[List[Double]]] // Type of Baz is String
+type Bin = Name[Nothing] // Type of Bin is String
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-const-usage dotty=dotty-const-usage id="const-type-usage" %}
@@ -252,7 +250,7 @@ object ProjectF {
     )
   )
   
-  /* Imagine yourself where snakeCaseRename comes from */
+  // Imagine yourself where snakeCaseRename comes from
   val snakeCaseNames: ProjectF[Const[List[String]]#λ] = transformNames(names)(snakeCaseRename)
 }
 {% endcapture %}
@@ -283,7 +281,7 @@ object ProjectF with
     )
   )
   
-  /* Imagine yourself where snakeCaseRename comes from */
+  // Imagine yourself where snakeCaseRename comes from
   val snakeCaseNames: ProjectF[Const[List[String]]] = transformNames(names)(snakeCaseRename)
 {% endcapture %}
 
@@ -295,7 +293,7 @@ Wait... We just applied a function over the entire structure. Can we do this wit
 
 {% capture scala-projectF-const-functor %}
 object ProjectF {
-  ... /* All the stuff we defined before */
+  ... // All the stuff we defined before
    
   implicit val projectConstFunctor: Functor[λ[A => ProjectF[Const[A]#λ]]] = new Functor[λ[A => ProjectF[Const[A]#λ]]] {
     override def map[A, B](fa: ProjectF[Const[A]#λ])(f: A => B): ProjectF[Const[B]#λ] = ProjectF[Const[B]#λ](
@@ -312,7 +310,7 @@ object ProjectF {
 
 {% capture dotty-projectF-const-functor %}
 object ProjectF with
-  ... /* All the stuff we defined before */
+  ... // All the stuff we defined before
    
   given Functor[[A] =>> ProjectF[Const[A]]]:
     override def [A, B](fa: ProjectF[Const[A]]) map(f: A => B): ProjectF[Const[B]] = ProjectF(
@@ -350,15 +348,13 @@ object FunctionK {
   }
 }
 
-/* Stick this in some package object somewhere */
+// Stick this in some package object somewhere
 type ~>:[A[_], B[_]] = FunctionK[A, B]
 {% endcapture %}
 
 {% capture dotty-functionK %}
-/* 
-Luckily Dotty already has an encoding for these, 
-so we'll just add a few type aliases 
-*/
+// Luckily Dotty already has an encoding for these, 
+// so we'll just add a few type aliases 
 type FunctionK[A[_], B[_]] = [Z] => A[Z] => B[Z]
 type ~>:[A[_], B[_]] = FunctionK[A, B]
 
@@ -372,28 +368,22 @@ object FunctionK with
 
 We can create and use them like this.
 {% capture scala-functionK-usage %}
-/* 
-Normal usage looks like so. We need to create a new instance of the class in 
-the same way you had for functions in Java before Java 8.
-*/
+// Normal usage looks like so. We need to create a new instance of the class in 
+// the same way you had for functions in Java before Java 8.
 val headOption1: List ~>: Option = new (List ~>: Option) {
   override def apply[Z](fa: List[Z]): Option[Z] = fa.headOption
 }
 
-/* 
-We can however also use Kind projector in simple cases, but then we loose the 
-ability to refer to the type.
-*/
+// We can however also use Kind projector in simple cases, but then we loose the 
+// ability to refer to the type.
 val headOption2: List ~>: Option = λ[List ~>: Option](_.headOption)
 
 val optHead: Option[Int] = headOption(Nil)
 {% endcapture %}
 
 {% capture dotty-functionK-usage %}
-/* 
-No underscore syntax here. You must define both the type, and the 
-parameter with the type applied. 
-*/
+// No underscore syntax here. You must define both the type, and the 
+// parameter with the type applied. 
 val headOption: List ~>: Option = [Z] => (a: List[Z]) => a.headOption
 
 val optHead: Option[Int] = headOption(Nil)
@@ -426,9 +416,9 @@ trait FunctorK with
 Wait, what's with the `C` type everywhere, why does `F` look like that. That's one of the things I'd rather not go into here right now as it complicates stuff a bit, but as a quick answer, take a look at lift, and tell me how you could get a return type of `F[A] ~>: F[B]` if we didn't have `C` around. For our use case with ProjectF, we can define this to ignore it for the most part.
 
 {% capture scala-functorKC %}
-/* Stick these in some package object somewhere */
+// Stick these in some package object somewhere
 
-/* Don't really have a good name for this one */
+// Don't really have a good name for this one
 type IgnoreC[F[_[_]]] = {
   type λ[A[_], _] = F[A]
 }
@@ -436,7 +426,7 @@ type FunctorKC[F[_[_]]] = FunctorK[IgnoreC[F]#λ]
 {% endcapture %}
 
 {% capture dotty-functorKC %}
-/* Don't really have a good name for this one */
+// Don't really have a good name for this one
 type IgnoreC[F[_[_]]] = [A[_], _] =>> F[A]
 type FunctorKC[F[_[_]]] = FunctorK[IgnoreC[F]]
 {% endcapture %}
@@ -482,7 +472,7 @@ trait ApplyK[F[_[_], _]] extends FunctorK[F] {
   def map2K[A[_], B[_], Z[_], C](fa: F[A, C], fb: F[B, C])(f: Tuple2K[A, B]#λ ~>: Z): F[Z, C]
 }
 
-/* Stick this in some package object */
+// Stick this in some package object
 type ApplyKC[F[_[_]]] = ApplyK[IgnoreC[F]]
 {% endcapture %}
 
@@ -514,7 +504,7 @@ trait ApplicativeK[F[_[_], _]] extends ApplyK[F] {
     apK(pureK[λ[D => A[D] => B[D]], C](λ[Const[Unit]#λ ~>: λ[D => A[D] => B[D]]](_ => f.apply)))(fa)
 }
 
-/* Stick this in some package object */
+// Stick this in some package object
 type ApplicativeKC[F[_[_]]] = ApplicativeK[IgnoreC[F]]
 {% endcapture %}
 
@@ -661,3 +651,5 @@ def createUpdater[F[_[_], _], C](
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-doobie-creator dotty=dotty-doobie-creator id="doobie-creator" %}
+
+Testing
