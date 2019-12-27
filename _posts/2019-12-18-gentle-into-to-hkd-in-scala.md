@@ -6,7 +6,10 @@ categories: scala hkd
 ---
 {% include code_blocks_init.html %}
 
-In Scala, we have higher kinded types. Using these, we can abstract over types that themselves take types, like `List`. You've probably seen higher kinded types used in typeclasses like `Functor` and friends, or in tagless final. Their usage often looks like this.
+In Scala, we have higher kinded types. Using these, we can abstract over types 
+that themselves take types, like `List`. You've probably seen higher kinded 
+types used in typeclasses like `Functor` and friends, or in tagless final. 
+Their usage often looks like this.
 ```scala
 trait Functor[F[_]] {
   def map[A, B](fa: F[A])(f: A => B): F[B]
@@ -19,29 +22,29 @@ trait UserService[F[_]] {
 }
 ```
 
-Today, however, I want to talk about another usage of higher kinded types called higher kinded data (HKD).
+Today, however, I want to talk about another usage of higher kinded types 
+called higher kinded data (HKD). Note that I do assume you're at least a bit familiar 
+with higher kinded types, and the most common typeclasses that use them like functor, 
+applicative, monad, and so on. 
 
 ## A mountain of boilerplate
 
-Say you're working at some REST endpoints, and need to return some data for the first endpoint, and allow it to be patched by another. Let's use an additional `Option`, to indicate if a JSON property was `undefined`.
+Say that you're working on a PATCH endpoint. You take a partial json body, and 
+change some stuff in the database for the provided values. Let's use an 
+additional `Option`, to indicate if a JSON property was `undefined`.
 ```scala
 //For this post, I'll use Circe and doobie for Json and SQL
-
-def showProject(projectId: String): IO[Result] = {
-  projects.withId(projectId).map(_.fold(NotFound)(a => Ok(a.asJson)))
-}
-
-def patchProject(projectId: String, json: Json): Result = {
+def patchProject(projectId: String, json: Json): IO[Result] = {
   val root = json.hcursor
   val settings = root.downField("settings")
   
   val partialProjectResult = (
     withUndefined[String]("name", root),
     withUndefined[String]("description", root),
-    withUndefined[List[String]]("keywords", json),
-    withUndefined[Option[String]]("issues", json),
-    withUndefined[Option[String]]("sources", json),
-    withUndefined[Option[String]]("support_channel", json),
+    withUndefined[List[String]]("keywords", settings),
+    withUndefined[Option[String]]("issues", settings),
+    withUndefined[Option[String]]("sources", settings),
+    withUndefined[Option[String]]("support_channel", settings),
   ).mapN(PartialProject.apply)
   
   
@@ -94,11 +97,23 @@ case class PartialProject(
 )
 ```
 
-That's a lot of code just for two endpoints. Luckily Circe can help us derive most of it in the get case, but for the patch case, we're not as lucky. Even worse, we have a lot more REST endpoints like this left to implement. What we might look at first is to maybe create a new typeclass for decoding a JSON value that will be used in a patch endpoint. That gets rid of one case of boilerplate, but there's still a lot left. Let's take a second look at the patch method, and replace all cases of boilerplate with `...`. Let's also parameterize all the cases where we refer to something specific.
+That's a lot of boilerplate just for a PATCH. Worse, there are more PATCH 
+endpoints. like this one that needs to be defined. Is there a better way to do this?
+We could maybe get rid of some of the boilerplate if we created a special 
+typeclass to decode partial data into case classes, and then use that on the 
+`PartialProject` class. That would only get rid of some of the boilerplate though.
+Wouldn't it be great if we could just create a method `handlePatch` that does 
+all the work for us? Could maybe be used something like this `handlePatch[Project]`. 
+Let's do a rough draft of what that might look like. We'll take a second look 
+at the patch method, and replace all cases of boilerplate with `...`. Let's 
+also parameterize all the cases where we refer to something specific.
 
 ```scala
-def patchThing(table: String, identifierColumn: String)(
-    identifier: String, json: Json
+def handlePatch[Thing](
+    table: String, 
+    identifierColumn: String, 
+    identifier: String, 
+    json: Json
 ): Result = {
   val partialThingResult = (
     ...
@@ -121,15 +136,27 @@ def patchThing(table: String, identifierColumn: String)(
 }
 ```
 
-Okay, that's not as bad. If we just sprinkle in some shapeless records and loop over it a few times, we should have the method we want, right? Yes, that is right, but it also lands us right into logic programming land. Shapeless is nice for derivation of typeclasses and such, where you can just trust the type signature. It's a bit worse in actual application code. Is there another way to solve this problem that does not include using shapeless at all, and shows more of our intent? Yes, there is.
+Okay, that's not as bad. If we just sprinkle in some shapeless records and 
+loop over it a few times, we should have the method we want, right? Yes, that 
+is right, but it also lands us right into logic programming land. Shapeless is 
+nice for derivation of typeclasses and such, where you can just trust the type 
+signature. It's a bit worse in actual application code, where you want to read 
+what is actually happening, and can't just look at the types. Is there another 
+way to solve this problem that does not include using shapeless at all, and 
+shows more of our intent? Yes, there is.
 
 ## Introducing ProjectF
-Look back at the boilerplate mountain. We wrote two case classes, with the same fields, just that one had everything wrapped in `Option`. Let's instead define a single case class with a higher kinded type parameter, which indicates the wrapping type.
+Look back at the boilerplate mountain. We wrote two case classes, with the 
+same fields, just that one had everything wrapped in `Option`. Let's instead 
+define a single case class with a higher kinded type parameter, which 
+indicates the wrapping type.
 ```scala
 case class ProjectF[F[_]](
   name: F[String],
   description: F[String],
-  // Note that I don't wrap this in F, as it's content will be wrapped in F instead
+  // Note that I don't wrap this in F, as it's content will be wrapped in F 
+  // instead. I might talk about when you also want to wrap this in F at a 
+  // later point
   settings: ProjectSettings[F]
 )
 
@@ -141,12 +168,19 @@ case class ProjectSettingsF[F[_]](
 )
 ```
 
+This is the one of the cornerstones of higher kinded data (HKD), the data itself. 
+Note that I split up the class into two smaller classes to mirror the JSON
+structure. You can go either way here, and it shouldn't matter for the patch 
+method, as long as the parameters you'll pass in are the same.
+
 We can now get back `PartialProject` like so.
 ```scala
 type PartialProject = ProjectF[Option]
 ```
 
-Can we also use this case class for the non-partial case class? Yes, using the `Id` type. The `Id` type just spits back out what we throw at it. Think of it like a type level `Predef.identity`.
+Can we also use this case class for the non-partial case class? Yes, using the 
+`Id` type. The `Id` type just spits back out what we throw at it. Think of it 
+like a type level `Predef.identity`.
 ```scala
 type Id[A] = A
 type Project = ProjectF[Id]
@@ -154,7 +188,9 @@ type Project = ProjectF[Id]
 
 ### Const is a really useful type
 
-There is one more important type and instance we need, `Const`. (When the Scala and Dotty representation of a concept differs substantially, I'll include both.)
+There is one more important type and instance we need, `Const`. (When the 
+Scala and Dotty representation of a concept differs substantially, I'll 
+include both.)
 {% capture scala-const %}
 // Here we're defining a partially applied type. We use it like so 
 // Const[String]#λ[Int], or if we're in a place expecting a higher kinded 
@@ -170,7 +206,9 @@ type Const[A] = [B] =>> A
 
 {% include code_blocks_code.html scala=scala-const dotty=dotty-const id="const-type" %}
 
-It is, in some ways, opposite to how `Id` works. While `Id` spits back what we threw at it, `Const` ignores that and instead spits back what it was initially applied with. Here's an example.
+It is, in some ways, opposite to how `Id` works. While `Id` spits back what we 
+threw at it, `Const` ignores that and instead spits back what it was initially 
+applied with. Here's an example.
 {% capture scala-const-usage %}
 type Name[A] = Const[String]#λ[A]
 
@@ -190,7 +228,11 @@ type Bin = Name[Nothing] // Type of Bin is String
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-const-usage dotty=dotty-const-usage id="const-type-usage" %}
-What's so important about `Const`? It allows us to put any type into `ProjectF` we want, as long as it's the same everywhere. I just showed one such use case. `Const[List[String]]` allows us to put the field names into the structure. We need the list here to also account for parents in nested HKD structures. (More on nested HKD much later)
+What's so important about `Const`? It allows us to put any type into `ProjectF` 
+we want, as long as it's the same everywhere. I just showed one such use case. 
+`Const[List[String]]` allows us to put the field names into the structure. We 
+need the list here to also account for parents in nested HKD structures. (More 
+on nested HKD much later)
 
 {% capture scala-projectF-names %}
 object ProjectF {
@@ -222,7 +264,11 @@ object ProjectF with
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-projectF-names dotty=dotty-projectF-names id="projectF-names" %}
-This is one of the things it can be nice to have a macro generate, but for now, we'll write it out manually. Anyway, that's pretty nice, just one problem. In many of our cases, we're using `snake_case`. We could just redefine `ProjectF`, but what if we instead made a function that transforms the strings in the structure?
+This is one of the things it can be nice to have a macro generate, but for now
+, we'll write it out manually. Anyway, that's pretty nice, just one problem. 
+In many of our cases, we're using `snake_case`. We could just redefine 
+`ProjectF`, but what if we instead made a function that transforms the strings 
+in the structure?
 
 {% capture scala-projectF-names-transform %}
 object ProjectF {
@@ -289,7 +335,9 @@ object ProjectF with
 
 ## Let's implement some typeclasses
 
-Wait... We just applied a function over the entire structure. Can we do this with any type? Isn't that what a functor is? Yes, and `ProjectF[Const]` has one. Let's define it.
+Wait... We just applied a function over the entire structure. Can we do this 
+with any type? Isn't that what a functor is? Yes, and `ProjectF[Const]` has 
+one. Let's define it.
 
 {% capture scala-projectF-const-functor %}
 object ProjectF {
@@ -325,7 +373,13 @@ object ProjectF with
 
 {% include code_blocks_code.html scala=scala-projectF-const-functor dotty=dotty-projectF-const-functor id="projectF-const-functor" %}
 
-Okay, so we got some nice abstraction for `Const`. Can we generalize it further, what would that look like? Currently, we have a `map` function that takes in a `ProjectF[Const[A]#λ]`, and returns a `ProjectF[Const[B]#λ]`. What if we could instead define a function that takes a `ProjectF[A]`, and returns a `ProjectF[B]`, where `A` and `B` are higher kinded types? That sounds like a functor on `ProjectF`. Before we define this, we need yet another type. `A => B` just won't be enough anymore.
+Okay, so we got some nice abstraction for `Const`. Can we generalize it 
+further, what would that look like? Currently, we have a `map` function that 
+takes in a `ProjectF[Const[A]#λ]`, and returns a `ProjectF[Const[B]#λ]`. 
+What if we could instead define a function that takes a `ProjectF[A]`, and 
+returns a `ProjectF[B]`, where `A` and `B` are higher kinded types? That 
+sounds like a functor on `ProjectF`. Before we define this, we need yet 
+another type. `A => B` just won't be enough anymore.
 
 ### Natural transformations
 What we need is to somehow be able to pass something like this as a value.
@@ -333,7 +387,10 @@ What we need is to somehow be able to pass something like this as a value.
 def headOption[A](xs: List[A]): Option[A] = xs.headOption
 ```
 
-We can pass `List[Int] => Option[Int]` and `List[String] => Option[String]` as values, but `List => Option` isn't valid. Luckily there is a way to encode what we want. We can define a new type `FunctionK`, and alias it to `~>:`. I throw on a `:` here as I prefer my arrows to associate in the right direction.
+We can pass `List[Int] => Option[Int]` and `List[String] => Option[String]` 
+as values, but `List => Option` isn't valid. Luckily there is a way to encode 
+what we want. We can define a new type `FunctionK`, and alias it to `~>:`. 
+I throw on a `:` here as I prefer my arrows to associate in the right direction.
 
 {% capture scala-functionK %}
 trait FunctionK[A[_], B[_]] {
@@ -392,7 +449,8 @@ val optHead: Option[Int] = headOption(Nil)
 {% include code_blocks_code.html scala=scala-functionK-usage dotty=dotty-functionK-usage id="functionK-usage" %}
 
 ### FunctorK
-We now have almost all the pieces we need. We just need a new functor typeclass which can handle our new types.
+We now have almost all the pieces we need. We just need a new functor 
+typeclass which can handle our new types.
 
 {% capture scala-functorK %}
 trait FunctorK[F[_[_], _]] {
@@ -413,7 +471,11 @@ trait FunctorK with
 
 {% include code_blocks_code.html scala=scala-functorK dotty=dotty-functorK id="functorK" %}
 
-Wait, what's with the `C` type everywhere, why does `F` look like that. That's one of the things I'd rather not go into here right now as it complicates stuff a bit, but as a quick answer, take a look at lift, and tell me how you could get a return type of `F[A] ~>: F[B]` if we didn't have `C` around. For our use case with ProjectF, we can define this to ignore it for the most part.
+Wait, what's with the `C` type everywhere, why does `F` look like that. That's 
+one of the things I'd rather not go into here right now as it complicates 
+stuff a bit, but as a quick answer, take a look at lift, and tell me how you 
+could get a return type of `F[A] ~>: F[B]` if we didn't have `C` around. For 
+our use case with ProjectF, we can define this to ignore it for the most part.
 
 {% capture scala-functorKC %}
 // Stick these in some package object somewhere
@@ -434,7 +496,8 @@ type FunctorKC[F[_[_]]] = FunctorK[IgnoreC[F]]
 {% include code_blocks_code.html scala=scala-functorKC dotty=dotty-functorKC id="functorKC" %}
 
 ### ApplyK and ApplicativeK
-Great, we have our `FunctorK` typeclass. Let's get a few more. Next up is `ApplyK`, but before we create that one, we need to encode tuples.
+Great, we have our `FunctorK` typeclass. Let's get a few more. Next up is 
+`ApplyK`, but before we create that one, we need to encode tuples.
 
 {% capture scala-tupleK %}
 type Tuple2K[F[_], G[_]] = { 
@@ -459,7 +522,8 @@ case class TupledProject(
   supportChannel: (List[Option[String]], Option[Option[String]])
 )
 ```
-With that out of the way, let's define `ApplyK`. This is probably the most useful typeclass for HKD I think.
+With that out of the way, let's define `ApplyK`. This is probably the most 
+useful typeclass for HKD I think.
 
 {% capture scala-applyK %}
 trait ApplyK[F[_[_], _]] extends FunctorK[F] {
@@ -491,7 +555,12 @@ type ApplyKC[F[_[_]]] = ApplyK[IgnoreC[F]]
 
 {% include code_blocks_code.html scala=scala-applyK dotty=dotty-applyK id="applyK" %}
 
-We can also define the least useful typeclass, `ApplicativeK`. Why is it so useless? Because unlike with the normal applicative, there aren't many cases where we want to construct a new instance of our type. In fact, doing so is hard because we need to be able to construct `A[Z]`, for all types `Z`. Either you can use `Const`, `A[Nothing]` where `A` is covariant, or `A[Any]`, where `A` is contravariant.
+We can also define the least useful typeclass, `ApplicativeK`. Why is it so 
+useless? Because unlike with the normal applicative, there aren't many cases 
+where we want to construct a new instance of our type. In fact, doing so is 
+hard because we need to be able to construct `A[Z]`, for all types `Z`. Either 
+you can use `Const`, `A[Nothing]` where `A` is covariant, or `A[Any]`, where 
+`A` is contravariant.
 
 {% capture scala-applicativeK %}
 trait ApplicativeK[F[_[_], _]] extends ApplyK[F] {
@@ -523,7 +592,9 @@ type ApplicativeKC[F[_[_]]] = ApplicativeK[IgnoreC[F]]
 {% include code_blocks_code.html scala=scala-applicativeK dotty=dotty-applicativeK id="applicativeK" %}
 
 ## First step away from the boilerplate
-While we're still missing a few pieces that we're going to need, we can begin to look at how we can use these typeclasses to get rid of the boilerplate. Let's focus on this piece of code.
+While we're still missing a few pieces that we're going to need, we can begin 
+to look at how we can use these typeclasses to get rid of the boilerplate. 
+Let's focus on this piece of code.
 ```scala
 val root = json.hcursor
 val settings = root.downField("settings")
@@ -538,7 +609,8 @@ val partialProjectResult = (
 ).mapN(PartialProject.apply)
 ```
 
-What do we need here? We need the names which we already have and the decoders. Let's make a new instance of `ProjectF` filled with decoders.
+What do we need here? We need the names which we already have and the decoders. 
+Let's make a new instance of `ProjectF` filled with decoders.
 ```scala
 val projectDecoders: ProjectF[Decoder] = ProjectF[Decoder](
   Decoder[String],
@@ -552,7 +624,8 @@ val projectDecoders: ProjectF[Decoder] = ProjectF[Decoder](
 )
 ```
 
-We also need the cursor to use. Take all that, blend it together, and we get a method to decode an HKD type from a patch payload.
+We also need the cursor to use. Take all that, blend it together, and we get a 
+method to decode an HKD type from a patch payload.
 
 {% capture scala-patch-decode-wrong %}
 def patchDecode[F[_[_], _], C](names: F[Const[List[String]]#λ, C], decoders: F[Decoder, C], cursor: ACursor)(
@@ -590,7 +663,12 @@ def patchDecode[F[_[_], _], C](names: F[Const[List[String]], C], decoders: F[Dec
 
 {% include code_blocks_code.html scala=scala-patch-decode-wrong dotty=dotty-patch-decode-wrong id="patch-decode-wrong" %}
 
-Wonderful, this is what we want, right? Almost. Just one problem left. Using this with `ProjectF`, it gives us a `ProjectF[λ[A => Decoder.AccumulatingResult[Option[A]]]]`, but what we want is a `Decoder.AccumulatingResult[ProjectF[Option]]`. That sounds like a call to `sequence`. Guess we'll need `TraverseK` too. Before we go off and do `TraverseK` too, let's look at some of the other boilerplate.
+Wonderful, this is what we want, right? Almost. Just one problem left. Using 
+this with `ProjectF`, it gives us a 
+`ProjectF[λ[A => Decoder.AccumulatingResult[Option[A]]]]`, but what we want is 
+a `Decoder.AccumulatingResult[ProjectF[Option]]`. That sounds like a call to 
+`sequence`. Guess we'll need `TraverseK` too. Before we go off and do 
+`TraverseK` too, let's look at some of the other boilerplate.
 
 ```scala
 val sets = Fragments.setOpt(
@@ -608,9 +686,21 @@ val hasAnyUpdates = partialProject.name.isDefined ||
   partialProject.supportChannel.isDefined
 ```
 
-`hasAnyUpdates` is probably the easiest one here, and the only one we could technically solve (if we erased some types) right now. Say that we somehow could convert any `ProjectF[A]` into a `List[A[_]]`. In that case, the problem becomes easy. We just fold over the list. Can we get rid of the list, and just fold over the `ProjectF` directly? If we had `FoldableK` we could.
+`hasAnyUpdates` is probably the easiest one here, and the only one we could 
+technically solve (if we erased some types) right now. Say that we somehow 
+could convert any `ProjectF[A]` into a `List[A[_]]`. In that case, the problem 
+becomes easy. We just fold over the list. Can we get rid of the list, and just 
+fold over the `ProjectF` directly? If we had `FoldableK` we could.
 
-What about `sets`? `Fragments.setOpt` takes a vararg `Option[Fragment]`, so we probably need `FoldableK` here too, but before that, how do we get the fragments? We probably want our `ProjectF` to store functions from the used type to `Fragment`. Something like `ProjectF[λ[A => (A => Fragment)]]` (I've placed parenthesis around the type to make it easier to read). Once we have the `Option[A]`, we can then map it with the function `A => Fragment`, to get a `Const[Fragment]#λ[A]`. Only one problem in that plan, doobie resists slightly against dealing with HKD, mostly when dealing with nullable columns. We also can't use the interpolator to make our lives easy.
+What about `sets`? `Fragments.setOpt` takes a vararg `Option[Fragment]`, so we 
+probably need `FoldableK` here too, but before that, how do we get the fragments? 
+We probably want our `ProjectF` to store functions from the used type to `Fragment`. 
+Something like `ProjectF[λ[A => (A => Fragment)]]` (I've placed parenthesis 
+around the type to make it easier to read). Once we have the `Option[A]`, 
+we can then map it with the function `A => Fragment`, to get a `Const[Fragment]#λ[A]`. 
+Only one problem in that plan, doobie resists slightly against dealing with HKD, 
+mostly when dealing with nullable columns. We also can't use the interpolator 
+to make our lives easy.
 
 First, we need a type to translate between doobie's handling of `Option` and our handling.
 
