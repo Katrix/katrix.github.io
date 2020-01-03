@@ -4,7 +4,7 @@
 		tabs.on('click', e => {
 			e.preventDefault();
 			tabs.tab('show');
-			e.target.scrollIntoView();
+			setTimeout(() => e.target.scrollIntoView(), 150);
 		});
 		return tabs;
 	}
