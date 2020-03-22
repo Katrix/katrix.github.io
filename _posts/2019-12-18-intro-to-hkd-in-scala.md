@@ -24,7 +24,7 @@ trait UserService[F[_]] {
 
 Today, however, I want to talk about another usage of higher kinded types 
 called higher kinded data (HKD). Note that I do assume you're at least a bit familiar 
-with higher kinded types, and the most common typeclasses that use them like functor, 
+with higher kinded types, and the most common typeclasses that uses them like functor, 
 applicative, monad, and so on. I'm also assuming that you know what kind 
 projector is and why it's useful. This post would likely be twice as long if I
 would have to go over these things too, and there are better posts out there 
@@ -34,7 +34,8 @@ about them than what I can provide here.
 
 Say that you're working on a PATCH endpoint. You take a partial json body, and 
 change some stuff in the database for the provided values. Let's use an 
-additional `Option`, to indicate if a JSON property was `undefined`.
+additional `Option`, to indicate if a JSON property was `undefined`. That way 
+we can differntiate between a field having a value, it being `null`, and it being `undefined`.
 ```scala
 //For this post, I'll use Circe and doobie for Json and SQL
 def patchProject(projectId: String, json: Json): IO[Result] = {
@@ -50,16 +51,14 @@ def patchProject(projectId: String, json: Json): IO[Result] = {
     withUndefined[Option[String]]("support_channel", settings),
   ).mapN(PartialProject.apply)
   
-  
-  //Imagine what handleDecodeError looks like yourself
-  partialProjectResult.fold(handleDecodeError) { partialProject =>
+  partialProjectResult.map { partialProject =>
     val sets = Fragments.setOpt(
       partialProject.name.map(name => fr"name = $name"),
       partialProject.description.map(description => fr"description = $description"),
       partialProject.keywords.map(keywords => fr"keywords= $keywords"),
       partialProject.issues.map(issues => fr"issues = $issues"),
       partialProject.sources.map(sources => fr"sources = $sources"),
-      partialProject.supportChannel.map(supportChannels => fr"support_channel = $supportChannel"),
+      partialProject.supportChannel.map(supportChannel => fr"support_channel = $supportChannel"),
     )
   
     val query = sql"UPDATE projects  " ++ sets ++ fr"WHERE project_id = $projectId"
@@ -69,26 +68,18 @@ def patchProject(projectId: String, json: Json): IO[Result] = {
       partialProject.issues.isDefined || partialProject.sources.isDefined || 
       partialProject.supportChannel.isDefined
   
-    if (hasAnyUpdates) dbService.run(query.update.run).map(_ => NoContent)
+    if (hasAnyUpdates) query.update.run.transact(xa).map(_ => NoContent)
     else IO.pure(BadRequest("No updates specified"))
-  }
+  }.swap.map(handleDecodeError).merge //Imagine what handleDecodeError looks like yourself
 }
 
 def withUndefined[A: Decoder](
     field: String, cursor: ACursor
 ): Decoder.AccumulatingResult[Option[A]] = {
-  val result = if(cursor.succeeded) Some(cursor.get[A](field)) else None
+  val fieldCursor = cursor.downField(field)
+  val result = if(fieldCursor.succeeded) Some(fieldCursor.as[A]) else None
   result.sequence.toValidatedNel
 }
-
-@SnakeCaseDecoder case class Project(
-  name: String,
-  description: String,
-  keywords: List[String],
-  issues: Option[String],
-  sources: Option[String],
-  supportChannel: Option[String]
-)
 
 case class PartialProject(
   name: Option[String],
@@ -106,10 +97,10 @@ We could maybe get rid of some of the boilerplate if we created a special
 typeclass to decode partial data into case classes, and then use that on the 
 `PartialProject` class. That would only get rid of some of the boilerplate though.
 Wouldn't it be great if we could just create a method `handlePatch` that does 
-all the work for us? Could maybe be used something like this `handlePatch[Project]`. 
-Let's do a rough draft of what that might look like. We'll replace all cases 
-of boilerplate with `...`. Let's also parameterize all the cases where we 
-refer to something specific.
+all the work for us? Could maybe be used something like this `handlePatch[Project]`, 
+where `Project` is a non partial version of `PartialProject`. Let's do a rough 
+draft of what that might look like. We'll replace all cases of boilerplate 
+with `...`. Let's also parameterize all the cases where we use something specific to `Project`.
 
 ```scala
 def handlePatch[Thing](
@@ -122,8 +113,7 @@ def handlePatch[Thing](
     ...
   ).mapN(PartialThing.apply)
   
-  
-  partialThingResult.fold(handleDecodeError) { partialThing =>
+  partialThingResult.map { partialThing =>
     val sets = Fragments.setOpt(
         ...
     )
@@ -133,9 +123,9 @@ def handlePatch[Thing](
   
     val hasAnyUpdates = ...
   
-    if (hasAnyUpdates) dbService.run(query.update.run).map(_ => NoContent)
+    if (hasAnyUpdates) query.update.run.transact(xa).map(_ => NoContent)
     else IO.pure(BadRequest("No updates specified"))
-  }
+  }.swap.map(handleDecodeError).merge
 }
 ```
 
@@ -144,22 +134,22 @@ loop over it a few times, we should have the method we want, right? Yes, that
 would work, but it also lands us right into logic programming land. Shapeless is 
 nice for derivation of typeclasses and such, where you can just trust the type 
 signature. It's a bit worse in actual application code, where you want to read 
-what is actually happening, and can't just look at the types. Is there another 
-way to solve this problem that does not include using shapeless at all, and 
-shows more of our intent? Yes, there is.
+what is actually happening, and can't just look at the types. It would also 
+make our compile times go through the roof. Is there another way to solve this 
+problem that does not include using shapeless at all, and shows more of our intent? 
+Yes, there is.
 
 ## Introducing ProjectF
-Look back at the boilerplate mountain. We wrote two case classes, with the 
-same fields, just that one had everything wrapped in `Option`. Let's instead 
-define a single case class with a higher kinded type parameter, which 
-indicates the wrapping type.
+Look back at the boilerplate mountain. We had the type `PartialProject` which 
+was had all it's fields wrapped in `Option`. There is also likely a `Project` 
+type which is not partial. What if we instead made the wrapping type a 
+higher kinded type parameter?
 ```scala
 case class ProjectF[F[_]](
   name: F[String],
   description: F[String],
   // Note that I don't wrap this in F, as it's content will be wrapped in F 
-  // instead. I might talk about when you also want to wrap this in F at a 
-  // later point
+  // instead. I might talk about wrapping this in F at a later point
   settings: ProjectSettingsF[F]
 )
 
@@ -174,7 +164,7 @@ case class ProjectSettingsF[F[_]](
 This is the one of the cornerstones of higher kinded data (HKD), the data itself. 
 Note that I split up the class into two smaller classes to mirror the JSON
 structure. You can go either way here, and it shouldn't matter for the patch 
-method, as long as the parameters you'll pass in are the same. I'll talk a bit more about this later.
+method, as long as the parameters you'll pass in are the same. I'll touch on this a bit more later.
 
 We can now get back `PartialProject` like so.
 ```scala
@@ -193,7 +183,8 @@ type Project = ProjectF[Id]
 
 There is one more important type we need, `Const`. (When the 
 Scala and Dotty representation of a concept differs substantially, I'll 
-include both.)
+include both. For inline code `like this`, I'll go with the Dotty style, as 
+it's less noisy).
 {% capture scala-const %}
 // Here we're defining a partially applied type. We use it like so 
 // Const[String]#λ[Int], or if we're in a place expecting a higher kinded 
@@ -215,10 +206,11 @@ applied with. Here's an example.
 {% capture scala-const-usage %}
 type Name[A] = Const[String]#λ[A]
 
-type Foo = Name[Int] // Type of Foo is String
-type Bar = Name[String] // Type of Bar is String
-type Baz = Name[Option[List[Double]]] // Type of Baz is String
-type Bin = Name[Nothing] // Type of Bin is String
+// All the types here are String
+type Foo = Name[Int]
+type Bar = Name[String]
+type Baz = Name[Option[List[Double]]]
+type Bin = Name[Nothing]
 {% endcapture %}
 
 {% capture dotty-const-usage %}
@@ -226,15 +218,16 @@ type Bin = Name[Nothing] // Type of Bin is String
 // I do it here for less confusion.
 type Name[A] = Const[String][A]
 
-type Foo = Name[Int] // Type of Foo is String
-type Bar = Name[String] // Type of Bar is String
-type Baz = Name[Option[List[Double]]] // Type of Baz is String
-type Bin = Name[Nothing] // Type of Bin is String
+// All the types here are String
+type Foo = Name[Int]
+type Bar = Name[String]
+type Baz = Name[Option[List[Double]]]
+type Bin = Name[Nothing]
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-const-usage dotty=dotty-const-usage id="const-type-usage" %}
 What's so important about `Const`? It allows us to put any type into `ProjectF` 
-we want, as long as it's the same everywhere. `ProjectF[Const[A]]` therefore 
+that we want, as long as it's the same everywhere. `ProjectF[Const[A]]` therefore 
 becomes similar to something like this.
 
 ```scala
@@ -258,8 +251,8 @@ case class ProjectSettingsConst[A](
 Why is this useful? Because it allows us to essentially "tag" data with which 
 field it belongs to. For example, we could have a `ProjectF[Const[String]]` 
 instance where each field contains the name of the field. Could we use a 
-`ProjectF[Const[String]]`instance where the fields contains their names to 
-store the json field names? No, we're still missing something. In such an 
+`ProjectF[Const[String]]` instance where the fields contains the field name 
+for use with our JSON stuff above? No, we're still missing something. In such an 
 instance, the value of `project.settings.issues` would be `"issues"`, but that 
 completely ignores the settings field. The fix for that is simple, instead 
 of `Const[String]`, let's use `Const[List[String]]`. Giving such an instance 
@@ -284,7 +277,7 @@ object ProjectF {
 {% endcapture %}
 
 {% capture dotty-projectF-names %}
-object ProjectF with
+object ProjectF:
   val names: ProjectF[Const[List[String]]] = ProjectF(
     List("name"),
     List("description"),
@@ -298,8 +291,8 @@ object ProjectF with
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-projectF-names dotty=dotty-projectF-names id="projectF-names" %}
-This is one of the things it can be nice to have a macro generate, but for now
-, we'll write it out manually. Anyway, that's pretty nice, just one problem. 
+This looks a lot like boilerplate, but luckily it's boilerplate a macro can 
+handle. For now we'll write it out manually. Anyway, that's pretty nice, just one problem. 
 In many of our cases, we're using `snake_case`. We could just redefine 
 `ProjectF`, but what if we instead made a function that transforms the strings 
 in the structure?
@@ -327,12 +320,12 @@ object ProjectF {
 {% endcapture %}
 
 {% capture dotty-projectF-names-transform %}
-object ProjectF with
+object ProjectF:
   val names = ...
   
   def transformNames(oldNames: ProjectF[Const[List[String]]])(
       f: String => String
-  ): ProjectF[Const[String]#λ] = ProjectF(
+  ): ProjectF[Const[List[String]]] = ProjectF(
     oldNames.name.map(f),
     oldNames.description.map(f),
     ProjectSettingsF(
@@ -352,7 +345,7 @@ object ProjectF with
 ## Let's implement some typeclasses
 
 Wait... We just applied a function over the entire structure. Can we do this 
-with any type? Isn't that what a functor is? Yes, and `ProjectF[Const]` has 
+with any type? Isn't that what a functor is? Yes, and `[A] => ProjectF[Const[A]]` has 
 one. Let's define it.
 
 {% capture scala-projectF-const-functor %}
@@ -366,10 +359,10 @@ object ProjectF {
           f(fa.name),
           f(fa.description),
           ProjectSettingsF[Const[B]#λ](
-            f(fa.keywords),
-            f(fa.issues),
-            f(fa.sources),
-            f(fa.supportChannel)
+            f(fa.settings.keywords),
+            f(fa.settings.issues),
+            f(fa.settings.sources),
+            f(fa.settings.supportChannel)
           )
         )
     }
@@ -385,10 +378,10 @@ object ProjectF with
       f(fa.name),
       f(fa.description),
       ProjectSettingsF(
-        f(fa.keywords),
-        f(fa.issues),
-        f(fa.sources),
-        f(fa.supportChannel)
+        f(fa.settings.keywords),
+        f(fa.settings.issues),
+        f(fa.settings.sources),
+        f(fa.settings.supportChannel)
       )
     )
 {% endcapture %}
@@ -396,7 +389,7 @@ object ProjectF with
 {% include code_blocks_code.html scala=scala-projectF-const-functor dotty=dotty-projectF-const-functor id="projectF-const-functor" %}
 
 Okay, so we got some nice abstraction for `Const`. Can we generalize it 
-further and what would that look like? Currently, we have a `map` function that 
+further? What would that look like? Currently, we have a `map` function that 
 takes in a `ProjectF[Const[A]]`, and returns a `ProjectF[Const[B]]`. 
 What if we could instead define a function that takes a `ProjectF[A]`, and 
 returns a `ProjectF[B]`, where `A` and `B` are higher kinded types? That 
@@ -437,7 +430,7 @@ type ~>:[A[_], B[_]] = FunctionK[A, B]
 type FunctionK[A[_], B[_]] = [Z] => A[Z] => B[Z]
 type ~>:[A[_], B[_]] = FunctionK[A, B]
 
-object FunctionK with
+object FunctionK:
   def identity[F[_]]: F ~>: F = [Z] => (fz: F[Z]) => fz
 
   def const[F[_], A](a: A): F ~>: Const[A] = [Z] => (fz: F[Z]) => a
@@ -484,7 +477,7 @@ trait FunctorK[F[_[_]]] {
 {% endcapture %}
 
 {% capture dotty-functorK %}
-trait FunctorK[F[_[_]]] with
+trait FunctorK[F[_[_]]]:
   def [A[_], B[_]](fa: F[A]) mapK(f: A ~>: B): F[B]
   
   def liftK[A[_], B[_]](f: A ~>: B): F[A] => F[B] = _.mapK(f)
@@ -497,8 +490,8 @@ involves raising all the kinds of the types by one. `F[_]` becomes `F[_[_]]`,
 `A` becomes `A[_]`, and so on.
 
 (NOTE: While it won't matter too much for this post, I should not that the 
-above typeclass is not the one I use myself most of the time. Most notably, 
-it's not an endofunctor. More on that later at some point. Why isn't in an 
+above typeclass is not the one I use myself most of the time. 
+It's not an endofunctor. More on that later at some point. Why isn't in an 
 endofunctor? In an endofunctor, the arrow in `lift` is the same type of arrow 
 as the one returned, while here we take an `~>:` arrow and return an `=>` arrow.)
 
@@ -520,6 +513,9 @@ type Tuple2K[A[_], B[_]] = [Z] =>> (A[Z], B[Z])
 
 // Arity 0 and arity 2 is enough for this case
 type ValueK[A[_]] = [Z] => () => A[Z]
+object ValueK:
+  def const[A](a: A): ValueK[Const[A]] = [Z] => () => a
+
 type Function2K[A[_], B[_], C[_]] = [Z] => (A[Z], B[Z]) => C[Z]
 {% endcapture %}
 
@@ -541,7 +537,8 @@ case class TupledProjectSettings(
 )
 ```
 With that out of the way, let's define `ApplyK`. This is probably the most 
-useful typeclass for HKD I think.
+useful typeclass for HKD I think. (There is one even more useful, but we'll 
+save it for later).
 
 {% capture scala-applyK %}
 trait ApplyK[F[_[_]]] extends FunctorK[F] {
@@ -556,7 +553,7 @@ trait ApplyK[F[_[_]]] extends FunctorK[F] {
 {% endcapture %}
 
 {% capture dotty-applyK %}
-trait ApplyK[F[_[_]]] extends FunctorK[F]
+trait ApplyK[F[_[_]]] extends FunctorK[F]:
   def [A[_], B[_]](ff: F[[D] =>> A[D] => B[D]]) apK(fa: F[A]): F[B] =
     ff.map2K(fa)([Z] => (f: A[Z] => B[Z], az: A[Z]) => f(az))
 
@@ -574,7 +571,7 @@ useless? Because unlike with the normal applicative, there aren't many cases
 where we want to construct a new instance of our type. In fact, doing so is 
 hard because we need to be able to construct `A[Z]`, for all types `Z`. Either 
 you can use `Const`, `A[Nothing]` where `A` is covariant, or `A[Any]`, where 
-`A` is contravariant. It also gives us nothing more compared to `Applicative[F[Const]]`.
+`A` is contravariant. It also gives us nothing more compared to `Applicative[[A] =>> F[Const[A]]]`.
 
 {% capture scala-applicativeK %}
 trait ApplicativeK[F[_[_]]] extends ApplyK[F] {
@@ -589,13 +586,13 @@ trait ApplicativeK[F[_[_]]] extends ApplyK[F] {
 {% endcapture %}
 
 {% capture dotty-applicativeK %}
-trait ApplicativeK[F[_[_]]] extends ApplyK[F]
+trait ApplicativeK[F[_[_]]] extends ApplyK[F]:
   def [A[_]](a: ValueK[A]) pureK: F[A]
 
-  def unitK: F[Const[Unit]] = ValueK.const(()).pure
+  def unitK: F[Const[Unit]] = ValueK.const(()).pureK
 
   override def [A[_], B[_]](fa: F[A]) mapK(f: A ~>: B): F[B] =
-    ([Z] => () => f[Z]).pure[[D] =>> A[D] => B[D]].apK(fa)
+    ([Z] => () => f[Z]).pureK[[D] =>> A[D] => B[D]].apK(fa)
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-applicativeK dotty=dotty-applicativeK id="applicativeK" %}
@@ -651,7 +648,7 @@ def patchDecode[F[_[_]]](names: F[Const[List[String]]#λ], decoders: F[Decoder],
         val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
 
         val result = 
-          if (cursorWithNames.succeeded) Some(decoder.decode(cursorWithNames)) 
+          if (cursorWithNames.succeeded) Some(decoder.tryDecode(cursorWithNames)) 
           else None
         result.sequence.toValidatedNel
       }
@@ -661,15 +658,16 @@ def patchDecode[F[_[_]]](names: F[Const[List[String]]#λ], decoders: F[Decoder],
 
 {% capture dotty-patch-decode-wrong %}
 def patchDecode[F[_[_]]](names: F[Const[List[String]]], decoders: F[Decoder], cursor: ACursor)(
-    given ApplyK[F]
+    using ApplyK[F]
 ): F[[A] =>> Decoder.AccumulatingResult[Option[A]]] =
-  names.map2K(decoders) { [Z] => (names: List[String], decoders: Decoder[Z]) =>
-    val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
+  names.map2K(decoders) { [Z] => (names: List[String], decoder: Decoder[Z]) => {
+      val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
 
-    val result = 
-      if cursorWithNames.succeeded then Some(decoder.decode(cursorWithNames)) 
-      else None
-    result.sequence.toValidatedNel
+      val result = 
+        if cursorWithNames.succeeded then Some(decoder.tryDecode(cursorWithNames)) 
+        else None
+      result.sequence.toValidatedNel
+    }
   }
 {% endcapture %}
 
@@ -681,7 +679,7 @@ something at that field, and if there is, decode it using the decoder.
 
 Wonderful, this is what we want, right? Almost. Just one problem left. Using 
 this with `ProjectF`, it gives us a 
-`ProjectF[λ[A => Decoder.AccumulatingResult[Option[A]]]]`, but what we want is 
+`ProjectF[[A] =>> Decoder.AccumulatingResult[Option[A]]]`, but what we want is 
 a `Decoder.AccumulatingResult[ProjectF[Option]]`. That sounds like a call to 
 `sequence`. Guess we'll need `TraverseK` too. 
 
@@ -713,9 +711,9 @@ fold over the `ProjectF` directly? If we had `FoldableK` we could.
 What about `sets`? `Fragments.setOpt` takes a vararg `Option[Fragment]`, so we 
 probably need `FoldableK` here too, but before that, how do we get the fragments? 
 We probably want our `ProjectF` to store functions from the used type to `Fragment`. 
-Something like `ProjectF[λ[A => (A => Fragment)]]` (I've placed parenthesis 
+Something like `ProjectF[[A] =>> (A => Fragment)]` (I've placed parenthesis 
 around the type to make it easier to read). Once we have the `Option[A]`, 
-we can then map it with the function `A => Fragment`, to get a `Option[Const[Fragment]#λ[A]]`. 
+we can then map it with the function `A => Fragment`, to get a `Option[Fragment]`. 
 Only one problem in that plan, doobie resists slightly against dealing with HKD, 
 mostly when dealing with nullable columns. We also can't use the interpolator 
 to make our lives easy.
@@ -724,14 +722,14 @@ First, we need a type to translate between doobie's handling of `Option` and
 our handling. When you have your doobie fragments, they contain a list of 
 `Param.Elem` values. These are the values used in the prepared statement. 
 For any `A` with a `Put` instance, we can create a `Param.Elem` 
-using `Param.Elem.Arg(<outValue>, Put[A])`. Only problem is that the nullable 
-columns (`Option[A]`) don't have a `Put` instance. We can get a `Param.Elem` 
-instance for them using `Param.Elem.Opt`.
+using `Param.Elem.Arg(a, Put[A])`. Only problem is that the nullable 
+columns (`Option[A]`) don't have a `Put` instance. For those we need to 
+use `Param.Elem.Opt(optA, Put[A])` instead.
 
 We've hit a roadblock. For all values `A`, we want to create a `Param.Elem`,
 but to do so we require information about what `A` is. As that is information 
 we're not given, we're not going to get a nice answer here. There is a 
-solution though. We can take a `ProjectF[* => Param.Elem]` as a parameter. 
+solution though. We can take a `ProjectF[[A] =>> (A => Param.Elem)]` as a parameter. 
 That gives us a way to convert all the values to `Param.Elem`. Let's wrap it 
 in it's own type to make it a bit neater.
 
@@ -745,7 +743,7 @@ object ElemCreator {
 
 Great, we've gotten around that. Sometimes when dealing with HKD data you 
 need to get around obstacles like that. Generally you just need to figure out 
-how you can pass all the information you need so you don't need to inspect 
+how you can pass in all the information you need so you don't need to inspect 
 any types.
 
 {% capture scala-doobie-equals %}
@@ -768,11 +766,12 @@ def createEquals[F[_[_]]](
 def createEquals[F[_[_]]](
     names: F[Const[List[String]]],
     elemCreators: F[ElemCreator]
-)(given ApplyK[F]): F[[A] =>> (A => Fragment)] =
-  names.map2K(elemCreators) { [Z] => (names: List[String], creator: ElemCreator[Z]) =>
-    val columnName = names.last // The last name will be the column name
+)(using ApplyK[F]): F[[A] =>> (A => Fragment)] =
+  names.map2K(elemCreators) { [Z] => (names: List[String], creator: ElemCreator[Z]) => {
+      val columnName = names.last // The last name will be the column name
 
-    (value: Z) => Fragment.const(columnName) ++ Fragment(" = ?", List(creator.mkElem(value)))
+      (value: Z) => Fragment.const(columnName) ++ Fragment(" = ?", List(creator.mkElem(value)))
+    }
   }
 {% endcapture %}
 
@@ -801,9 +800,9 @@ although that's up to you to do.
 def createFragmentEquals[F[_[_]]](
     setters: F[* => Fragment],
     valuesToSet: F[Option]
-)(implicit F: ApplyK[F]): F[Const[Fragment]#λ] =
+)(implicit F: ApplyK[F]): F[Const[Option[Fragment]]#λ] =
   F.map2K(setters, valuesToSet)(
-    λ[Tuple2K[* => Fragment, Option]#λ ~>: Const[Fragment]#λ](t => t._2.fold(Fragment.empty)(t._1))
+    λ[Tuple2K[* => Fragment, Option]#λ ~>: Const[Option[Fragment]]#λ](t => t._2.map(t._1))
   )
 {% endcapture %}
 
@@ -811,9 +810,9 @@ def createFragmentEquals[F[_[_]]](
 def createFragmentEquals[F[_[_]]](
     setters: F[[A] =>> (A => Fragment)],
     valuesToSet: F[Option]
-)(given ApplyK[F]): F[[A] =>> (A => Fragment)] =
+)(using ApplyK[F]): F[Const[Option[Fragment]]] =
   setters.map2K(valuesToSet) { [Z] => (setter: Z => Fragment, value: Option[Z]) =>
-    value.fold(Fragment.empty)(setter)
+    value.map(setter)
   }
 {% endcapture %}
 
@@ -826,8 +825,7 @@ We've done what we can with the typeclasses we have up to this point. Time to cr
 First up is FoldableK. This one lets us accumulate the values in the HKD to a 
 single value, and leave the world of HKD. You often use FoldableK as the last 
 step in a chain of transformations. It will let us remove the boilerplate 
-from `hasAnyUpdates` and implement the last step of doobie's `sets`. Before we 
-do that though, let's add a few more to our collection.
+from `hasAnyUpdates` and implement the last step of doobie's `sets`.
 
 {% capture scala-foldableK %}
 trait FoldableK[F[_[_]]] {
@@ -843,14 +841,14 @@ trait FoldableK[F[_[_]]] {
 {% endcapture %}
 
 {% capture dotty-foldableK %}
-trait FoldableK[F[_[_]]]
+trait FoldableK[F[_[_]]]:
 
   def [A[_], B](fa: F[A]) foldLeftK(b: B)(f: B => A ~>: Const[B]): B
 
-  def [A[_], B](fa: F[A]) foldMapK(f: A ~>: Const[B])(given B: Monoid[B]): B =
-    fa.foldLeftK(B.empty)(b => [Z] => (fz: F[Z]) => B.combine(b, f(fz)))
+  def [A[_], B](fa: F[A]) foldMapK(f: A ~>: Const[B])(using B: Monoid[B]): B =
+    fa.foldLeftK(B.empty)(b => [Z] => (az: A[Z]) => b.combine(f(az)))
     
-  def [A](fa: F[Const[A]#λ]) toListK: List[A] = 
+  def [A](fa: F[Const[A]]) toListK: List[A] = 
     fa.foldMapK([Z] => (a: A) => List(a))
 {% endcapture %}
 
@@ -860,7 +858,7 @@ trait FoldableK[F[_[_]]]
 If `ApplyK` is the most useful typeclass for HKD, then these two take a close 
 second place.
 
-I mentioned way back that we had a `ProjectF[λ[A => Decoder.AccumulatingResult[Option[A]]]]`
+I mentioned way back that we had a `ProjectF[[A] =>> Decoder.AccumulatingResult[Option[A]]]`
 and wanted a `Decoder.AccumulatingResult[ProjectF[Option]]` and said we'd 
 need `TraverseK` for that. Just like `Traverse` lets us go 
 from `F[G[A]]` to `G[F[A]]`, `TraverseK` lets us go 
@@ -894,7 +892,7 @@ trait TraverseK[F[_[_]]] extends FunctorK[F] with FoldableK[F] {
 
 trait DistributiveK[F[_[_]]] extends FunctorK[F] {
 
-  def distributeK[G[_]: Functor, A[_], B[_]](gfa: G[F[A]])(f: F[λ[Z => G[A[Z]]]] ~>: B): F[B] =
+  def distributeK[G[_]: Functor, A[_], B[_]](gfa: G[F[A]])(f: λ[Z => G[A[Z]]] ~>: B): F[B] =
     mapK(cosequenceK(gfa))(f)
 
   def cosequenceK[G[_]: Functor, A[_]](gfa: G[F[A]]): F[λ[Z => G[A[Z]]]]
@@ -902,22 +900,22 @@ trait DistributiveK[F[_[_]]] extends FunctorK[F] {
 {% endcapture %}
 
 {% capture dotty-traverseK-distributiveK %}
-trait TraverseK[F[_[_]]] extends extends FunctorK[F] with FoldableK[F]
+trait TraverseK[F[_[_]]] extends FunctorK[F] with FoldableK[F]:
 
-  def [G[_]: Applicative, A[_], B[_]](fa: F[A]) traverseK(f: A ~>: ([Z] => G[B[Z]])): G[F[B]]
+  def [G[_]: Applicative, A[_], B[_]](fa: F[A]) traverseK(f: A ~>: ([Z] =>> G[B[Z]])): G[F[B]]
 
-  def [G[_]: Applicative, A[_]](fga: F[[Z] => G[A[Z]]]) sequenceK: G[F[A]] =
-    fga.traverseK(FunctionK.identity)(given Applicative[G])
+  def [G[_]: Applicative, A[_]](fga: F[[Z] =>> G[A[Z]]]) sequenceK: G[F[A]] =
+    fga.traverseK(FunctionK.identity[[Z] =>> G[A[Z]]])(using implicitly[Applicative[G]])
 
-  override def mapK[A[_], B[_]](fa: F[A])(f: A ~>: B): F[B] =
+  override def [A[_], B[_]](fa: F[A]) mapK(f: A ~>: B): F[B] =
     fa.traverseK[Id, A, B](f)
 
-trait DistributiveK[F[_[_]]] extends FunctorK[F]
+trait DistributiveK[F[_[_]]] extends FunctorK[F]:
 
-  def [G[_]: Functor, A[_], B[_]](gfa: G[F[A]]) distributeK(f: F[[Z] => G[B[Z]]] ~>: B): F[B] =
+  def [G[_]: Functor, A[_], B[_]](gfa: G[F[A]]) distributeK(f: ([Z] =>> G[A[Z]]) ~>: B): F[B] =
     cosequenceK(gfa).mapK(f)
 
-  def [G[_]: Functor, A[_]](gfa: G[F[A]]) cosequenceK: F[[Z] => G[A[Z]]]
+  def [G[_]: Functor, A[_]](gfa: G[F[A]]) cosequenceK: F[[Z] =>> G[A[Z]]]
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-traverseK-distributiveK dotty=dotty-traverseK-distributiveK id="traverseK-distributiveK" %}
@@ -946,8 +944,8 @@ Not that we have all the typeclasses we'll need, let's put the to use. First
 stop, implementing them for `ProjectF` and `ProjectSettingsF`.
 
 {% capture scala-projectF-all-instances %}
-val F: ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributeK[ProjectF] =
-  new ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributeK[ProjectF] {
+implicit val F: ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributiveK[ProjectF] =
+  new ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributiveK[ProjectF] {
   
     def pureK[A[_]](a: Const[Unit]#λ ~>: A): ProjectF[A] = ProjectF[A](
       a(()),
@@ -962,7 +960,7 @@ val F: ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributeK[ProjectF
         implicitly[ApplyK[ProjectSettingsF]].map2K(fa.settings, fb.settings)(f),
       )
       
-    def foldLeftK[A[_], B](fa: F[A], b: B)(f: B => A ~>: Const[B]#λ): B = {
+    def foldLeftK[A[_], B](fa: ProjectF[A], b: B)(f: B => A ~>: Const[B]#λ): B = {
       val b1 = f(b)(fa.name)
       val b2 = f(b1)(fa.description)
       implicitly[FoldableK[ProjectSettingsF]].foldLeftK(fa.settings, b2)(f)
@@ -970,21 +968,21 @@ val F: ApplicativeK[ProjectF] with TraverseK[ProjectF] with DistributeK[ProjectF
     
     def traverseK[G[_]: Applicative, A[_], B[_]](fa: ProjectF[A])(f: A ~>: λ[Z => G[B[Z]]]): G[ProjectF[B]] = 
       (
-        fa.name, 
-        fa.description, 
+        f(fa.name), 
+        f(fa.description), 
         implicitly[TraverseK[ProjectSettingsF]].traverseK(fa.settings)(f)
-      ).mapN(ProjectF.apply)
+      ).mapN(ProjectF.apply[B])
     
     def cosequenceK[G[_]: Functor, A[_]](gfa: G[ProjectF[A]]): ProjectF[λ[Z => G[A[Z]]]] = 
       ProjectF[λ[Z => G[A[Z]]]](
         gfa.map(_.name),
         gfa.map(_.description),
-        implicitly[DistributeK[ProjectSettingsF]].cosequenceK(gfa.map(_.settings))
+        implicitly[DistributiveK[ProjectSettingsF]].cosequenceK(gfa.map(_.settings))
       )
   }
 
-val F: ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with DistributeK[ProjectSettingsF] =
-  new ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with DistributeK[ProjectSettingsF] {
+implicit val F: ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with DistributiveK[ProjectSettingsF] =
+  new ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with DistributiveK[ProjectSettingsF] {
   
     def pureK[A[_]](a: Const[Unit]#λ ~>: A): ProjectSettingsF[A] = ProjectSettingsF[A](
       a(()),
@@ -1000,8 +998,9 @@ val F: ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with Dist
         f((fa.sources, fb.sources)),
         f((fa.supportChannel, fb.supportChannel))
       )
-    
-    def foldLeftK[A[_], B](fa: F[A], b: B)(f: B => A ~>: Const[B]#λ): B = {
+  
+   //Note, this should work. Dotty does not like it however, and will instead crash
+    def foldLeftK[A[_], B](fa: ProjectSettingsF[A], b: B)(f: B => A ~>: Const[B]#λ): B = {
       val b1 = f(b)(fa.keywords)
       val b2 = f(b1)(fa.issues)
       val b3 = f(b2)(fa.sources)
@@ -1010,11 +1009,11 @@ val F: ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with Dist
     
     def traverseK[G[_]: Applicative, A[_], B[_]](fa: ProjectSettingsF[A])(f: A ~>: λ[Z => G[B[Z]]]): G[ProjectSettingsF[B]] = 
       (
-        fa.keywords, 
-        fa.issues,
-        fa.sources,
-        fa.supportChannel,
-      ).mapN(ProjectSettingsF.apply)
+        f(fa.keywords), 
+        f(fa.issues),
+        f(fa.sources),
+        f(fa.supportChannel),
+      ).mapN(ProjectSettingsF.apply[B])
     
     def cosequenceK[G[_]: Functor, A[_]](gfa: G[ProjectSettingsF[A]]): ProjectSettingsF[λ[Z => G[A[Z]]]] = 
       ProjectSettingsF[λ[Z => G[A[Z]]]](
@@ -1027,12 +1026,12 @@ val F: ApplicativeK[ProjectSettingsF] with TraverseK[ProjectSettingsF] with Dist
 {% endcapture %}
 
 {% capture dotty-projectF-all-instances %}
-given ApplicativeK[ProjectF], TraverseK[ProjectF], DistributeK[ProjectF]
+given ApplicativeK[ProjectF], TraverseK[ProjectF], DistributiveK[ProjectF]:
   
   def [A[_]](a: ValueK[A]) pureK: ProjectF[A] = ProjectF(
     a(),
     a(),
-    a.pureK
+    implicitly[ApplicativeK[ProjectSettingsF]].pureK(a)
   )
   
   def [A[_], B[_], Z[_]](fa: ProjectF[A]) map2K(fb: ProjectF[B])(f: Function2K[A, B, Z]): ProjectF[Z] = 
@@ -1042,22 +1041,23 @@ given ApplicativeK[ProjectF], TraverseK[ProjectF], DistributeK[ProjectF]
       fa.settings.map2K(fb.settings)(f)
     )
 
-  def [A[_], B](fa: F[A]) foldLeftK(b: B)(f: B => A ~>: Const[B]): B = 
+  //Note, this should work. Dotty does not like it however, and will instead crash
+  def [A[_], B](fa: ProjectF[A]) foldLeftK(b: B)(f: B => A ~>: Const[B]): B = 
     val b1 = f(b)(fa.name)
     val b2 = f(b1)(fa.description)
     fa.settings.foldLeftK(b2)(f)
   
-  def [G[_]: Applicative, A[_], B[_]](fa: ProjectF[A]) traverseK(f: A ~>: ([Z] => G[B[Z]])): G[ProjectF[B]] = 
-    (fa.name, fa.description, fa.settings.traverseK(f)).mapN(ProjectF.apply)
+  def [G[_]: Applicative, A[_], B[_]](fa: ProjectF[A]) traverseK(f: A ~>: ([Z] =>> G[B[Z]])): G[ProjectF[B]] = 
+    (f(fa.name), f(fa.description), fa.settings.traverseK(f)).mapN(ProjectF.apply)
   
-  def [G[_]: Functor, A[_]](gfa: G[ProjectF[A]]) cosequenceK: ProjectF[[Z] => G[A[Z]]] = 
+  def [G[_]: Functor, A[_]](gfa: G[ProjectF[A]]) cosequenceK: ProjectF[[Z] =>> G[A[Z]]] = 
     ProjectF(
       gfa.map(_.name),
       gfa.map(_.description),
       gfa.map(_.settings).cosequenceK
     )
 
-given ApplicativeK[ProjectSettingsF], TraverseK[ProjectSettingsF], DistributeK[ProjectSettingsF]
+given ApplicativeK[ProjectSettingsF], TraverseK[ProjectSettingsF], DistributiveK[ProjectSettingsF]:
   
   def [A[_]](a: ValueK[A]) pureK: ProjectSettingsF[A] = ProjectSettingsF(
     a(),
@@ -1074,16 +1074,16 @@ given ApplicativeK[ProjectSettingsF], TraverseK[ProjectSettingsF], DistributeK[P
       f(fa.supportChannel, fb.supportChannel)
     )
 
-  def [A[_], B](fa: F[A]) foldLeftK(b: B)(f: B => A ~>: Const[B]): B = 
+  def [A[_], B](fa: ProjectSettingsF[A]) foldLeftK(b: B)(f: B => A ~>: Const[B]): B = 
     val b1 = f(b)(fa.keywords)
     val b2 = f(b1)(fa.issues)
-    val b2 = f(b2)(fa.sources)
+    val b3 = f(b2)(fa.sources)
     f(b3)(fa.supportChannel)
   
-  def [G[_]: Applicative, A[_], B[_]](fa: ProjectSettingsF[A]) traverseK(f: A ~>: ([Z] => G[B[Z]])): G[ProjectSettingsF[B]] = 
-    (fa.keywords, fa.issues, fa.sources, fa.supportChannel).mapN(ProjectSettingsF.apply)
+  def [G[_]: Applicative, A[_], B[_]](fa: ProjectSettingsF[A]) traverseK(f: A ~>: ([Z] =>> G[B[Z]])): G[ProjectSettingsF[B]] = 
+    (f(fa.keywords), f(fa.issues), f(fa.sources), f(fa.supportChannel)).mapN(ProjectSettingsF.apply)
   
-  def [G[_]: Functor, A[_]](gfa: G[ProjectSettingsF[A]]) cosequenceK: ProjectSettingsF[[Z] => G[A[Z]]] = 
+  def [G[_]: Functor, A[_]](gfa: G[ProjectSettingsF[A]]) cosequenceK: ProjectSettingsF[[Z] =>> G[A[Z]]] = 
     ProjectSettingsF(
       gfa.map(_.keywords),
       gfa.map(_.issues),
@@ -1118,7 +1118,7 @@ def patchDecode[F[_[_]]](names: F[Const[List[String]]#λ], decoders: F[Decoder],
         val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
 
         val result = 
-          if (cursorWithNames.succeeded) Some(decoder.decode(cursorWithNames)) 
+          if (cursorWithNames.succeeded) Some(decoder.tryDecode(cursorWithNames)) 
           else None
         result.sequence.toValidatedNel
       }
@@ -1131,15 +1131,16 @@ def patchDecode[F[_[_]]](names: F[Const[List[String]]#λ], decoders: F[Decoder],
 
 {% capture dotty-patch-decode %}
 def patchDecode[F[_[_]]](names: F[Const[List[String]]], decoders: F[Decoder], cursor: ACursor)(
-    given ApplyK[F], TraverseK[F]
+    using ApplyK[F], TraverseK[F]
 ): Decoder.AccumulatingResult[F[Option]] =
-  names.map2K(decoders) { [Z] => (names: List[String], decoders: Decoder[Z]) =>
-    val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
+  names.map2K[Const[List[String]], Decoder, [Z] =>> Decoder.AccumulatingResult[Option[Z]]](decoders) { [Z] => (names: List[String], decoder: Decoder[Z]) => {
+      val cursorWithNames = names.foldLeft(cursor)(_.downField(_))
 
-    val result = 
-      if cursorWithNames.succeeded then Some(decoder.decode(cursorWithNames)) 
-      else None
-    result.sequence.toValidatedNel
+      val result = 
+        if cursorWithNames.succeeded then Some(decoder.tryDecode(cursorWithNames)) 
+        else None
+      result.sequence.toValidatedNel
+    }
   }.sequenceK
 {% endcapture %}
 
@@ -1155,7 +1156,7 @@ def hasAnyUpdates[F[_[_]]](fields: F[Option])(implicit F: FoldableK[F]): Boolean
 {% endcapture %}
 
 {% capture dotty-has-any-updates-fold %}
-def hasAnyUpdates[F[_[_]]](fields: F[Option])(given FoldableK[F]): Boolean = 
+def hasAnyUpdates[F[_[_]]](fields: F[Option])(using FoldableK[F]): Boolean = 
   fields.foldLeftK(false)(b => [A] => (optA: Option[A]) => b || optA.isDefined)
 {% endcapture %}
 
@@ -1163,7 +1164,7 @@ def hasAnyUpdates[F[_[_]]](fields: F[Option])(given FoldableK[F]): Boolean =
 
 ### doobie setter
 Next, let's finish our doobie updater. Let's build off `createFragmentEquals` 
-which gives us `F[Const[Fragment]#λ]` provided we pass in the setters, and the 
+which gives us `F[Const[Option[Fragment]]#λ]` provided we pass in the setters, and the 
 values we want to update.
 
 {% capture scala-doobie-setter %}
@@ -1172,7 +1173,7 @@ def updateTable[F[_[_]], A: Put](
     tableName: String,
     identifierColumn: String
 )(values: F[Option], identifier: A)(implicit F: ApplyK[F], FF: FoldableK[F]): ConnectionIO[Int] = {
-  val sets = Fragments.set(FF.toListK(createFragmentEquals(setters, valuesToSet)): _*)
+  val sets = Fragments.setOpt(FF.toListK(createFragmentEquals(setters, values)): _*)
   val cond = Fragment.const(identifierColumn) ++ fr"= $identifier"
   
   val query = sql"UPDATE " ++ Fragment.const(tableName) ++ sets ++ cond
@@ -1182,11 +1183,11 @@ def updateTable[F[_[_]], A: Put](
 
 {% capture dotty-doobie-setter %}
 def updateTable[F[_[_]], A: Put](
-    setters: F[[A] => (A => Fragment)],
+    setters: F[[Z] =>> (Z => Fragment)],
     tableName: String,
     identifierColumn: String
-)(values: F[Option], identifier: A)(given ApplyK[F], FoldableK[F]): ConnectionIO[Int] =
-  val sets = Fragments.set(createFragmentEquals(setters, valuesToSet).toListK: _*)
+)(values: F[Option], identifier: A)(using ApplyK[F], FoldableK[F]): ConnectionIO[Int] =
+  val sets = Fragments.setOpt(createFragmentEquals(setters, values).toListK: _*)
   val cond = Fragment.const(identifierColumn) ++ fr"= $identifier"
   
   val query = sql"UPDATE " ++ Fragment.const(tableName) ++ sets ++ fr"WHERE" ++ cond
@@ -1202,20 +1203,20 @@ And to tie it all together, let's define a real version of `handlePatch` that we
 def handlePatch[F[_[_]], A: Put](
     names: F[Const[List[String]]#λ],
     decoders: F[Decoder],
+    elemCreators: F[ElemCreator],
     tableName: String, 
     identifierColumn: String, 
-    identifier: String, 
     json: Json,
     identifier: A
 )(implicit F: ApplyK[F], FT: TraverseK[F]): IO[Result] = {
   val partialThingResult = patchDecode(names, decoders, json.hcursor)
   
-  partialThingResult.fold(handleDecodeError) { partialThing =>
-    val update = updateTable(setters, tableName, identifierColumn)(partialThing, identifier)
+  partialThingResult.map { partialThing =>
+    val update = updateTable(createEquals(names, elemCreators), tableName, identifierColumn)(partialThing, identifier)
   
-    if (hasAnyUpdates(partialThing)) dbService.run(update).map(_ => NoContent)
+    if (hasAnyUpdates(partialThing)) update.transact(xa).map(_ => NoContent)
     else IO.pure(BadRequest("No updates specified"))
-  }
+  }.swap.map(handleDecodeError).merge
 }
 {% endcapture %}
 
@@ -1223,26 +1224,26 @@ def handlePatch[F[_[_]], A: Put](
 def handlePatch[F[_[_]], A: Put](
     names: F[Const[List[String]]],
     decoders: F[Decoder],
+    elemCreators: F[ElemCreator],
     tableName: String, 
     identifierColumn: String, 
-    identifier: String, 
     json: Json,
     identifier: A
-)(given ApplyK[F], TraverseK[F]): IO[Result] =
+)(using ApplyK[F], TraverseK[F]): IO[Result] =
   val partialThingResult = patchDecode(names, decoders, json.hcursor)
   
-  partialThingResult.fold(handleDecodeError) { partialThing =>
-    val update = updateTable(setters, tableName, identifierColumn)(partialThing, identifier)
+  partialThingResult.map { partialThing =>
+    val update = updateTable(createEquals(names, elemCreators), tableName, identifierColumn)(partialThing, identifier)
   
-    if hasAnyUpdates(partialThing) then dbService.run(update).map(_ => NoContent)
+    if hasAnyUpdates(partialThing) then update.transact(xa).map(_ => NoContent)
     else IO.pure(BadRequest("No updates specified"))
-  }
+  }.swap.map(handleDecodeError).merge
 {% endcapture %}
 
 {% include code_blocks_code.html scala=scala-handle-patch dotty=dotty-handle-patch id="handle-patch" %}
 
-We finally did it. We now have a generic path method that perfectly models 
-our intent. Not one place did we have to resort to logic programming. We 
+We finally did it. We now have a generic patch method that perfectly models 
+our intent. Not one place did we have to resort to logic programming. We also 
 gained more than just `handlePatch`. Best example is to look at `updateTable`.
 Here we're using it to update the DB based on the passed in JSON, but nothing
 says we're restricted to just that. Let's specialize it for `ProjectF` to get 
@@ -1250,14 +1251,18 @@ a better idea of what we have.
 
 ```scala
 def updateProject(values: ProjectF[Option], projectId: String) = 
-  updateTable(ProjectF.elemCreator, "projects", "project_id")(values, projectId)
+  updateTable(
+    createEquals(ProjectF.names, ProjectF.elemCreator), 
+    "projects", 
+    "project_id"
+  )(values, projectId)
 ```
 Turns out we can also use `updateTable` to do arbitrary simple updates to our
 models. It's not the only method we can potentially use in other places. 
 If you look at `patchDecode` it doesn't look too hard to turn that into a 
 typeclass. Can we then use something similar to derive JSON decoders for 
 case classes? Yes, turns out that HKD is very good at modeling typeclass 
-derivation, both for HKD and non-HKD, but more about that in some other post.
+derivation, both for HKD and non-HKD, but more about that next time.
 
 ## Closing words
 I hope this post has given you some ideas of what HKD is, and more importantly 
@@ -1265,30 +1270,57 @@ how it can be used. Rest assured that we've just been scratching the surface
 of HKD in this post. There is a lot more left to cover. Here's a rough plan on 
 what I have planned so far.
 
+### What about shapeless?
+Ok, so we've gone over a lot of ways to do stuff that doesn't use shapeless at 
+all. Does that mean that we can throw away all shapeless code? No, for a few 
+reasons.
+
+1. **Lower level:** Shapeless is for the most part much lower level than HKD.
+You can simply do so much more with it. That has a price to pay though. If we
+don't need all those features, we can instead use something where we don't need
+to pay that price.
+2. **Typechecker's language:** Shapeless speaks logic programming. As Scala 
+developers, we probably want to speak functional programming instead. FP is a
+large part of Scala, so that makes sense. There is one area however that does
+speak primarily logic programming, the typechecker. If you want to convince the
+typechecker about some fact it can't infer by itself, you need to speak logic
+programming. Shapeless is great in this area, and HKD fails miserably.
+3. **More than HLists:** Shapeless is much more than just HLists. All those 
+other parts are still just as useful.
+4. **Arities is hard:** This one is more practical than the others, but
+Shapeless is simply better at abstracting over arities than HKD allows you to.
+I'll cover this more when we talk about deriving ADTs. The most promising
+solution so far for this problem is to build a HKD type on top of HLists.
+That alone should tell you that HLists are still useful.
+
+I'll go much further in depth about this in a post about the pros and cons
+of HKD.
+
 ### Future plans
+* **Case class typeclass derivation:** While HKD is very useful, and gives us 
+lots of stuff for free, sometimes we just want to define normal ADTs instead. 
+That doesn't mean that we have to give up the power HKD give to us however. 
+Just like Shapeless 3 will add some of the operations we've seen here, like 
+`mapK`, `map2K`, `foldK` and such, we can take some building blocks from 
+Shapeless to allow us to derive typeclasses for simple ADTs. Do note however
+that deriving stuff for sum types is much more complicated. As such 
+we'll wait a bit with them until we've covered a few more topics.
 * **Nesting:** You might have noticed in some places that even though we 
 defined our structure as two classes `ProjectF` and `ProjectSettingsF`, it 
 didn't act like it, as we're used to. Why? How can we use this? And most 
 interestingly, what happes when we stick something other than `F[A]` into a 
 HKD type? For example, is `List[F[Int]]` valid? We'll also take a look a 
 sum HKD here.
-* **HKD Typeclass derivation:** In this post we saw many places where we could
-have used typeclass derivation to further simplify the code a bit. I didn't do
-that here to keep stuff simple. Next up after we've talked about nesting is
-how to derive typeclasses for HKD, and what building blocks we'll need. (
-You've already seen `Const[List[String]]`, which is one such building block, 
-but there are others).
-* **ADT Typeclass derivation:** While HKD is very useful, and gives us lots of
-stuff for free, sometimes we just want to define normal ADTs instead. That 
-doesn't mean that we have to give up the power HKD give to us however. 
-Just like Shapeless 3 will add some of the operations we've seen here, like 
-`mapK`, `map2K`, `foldK` and such, we can take some building blocks from 
-Shapeless to allow us to derive typeclasses for simple ADTs.
 * **MonadK:** Monad tutorial incoming eventually I guess. At that point we
 can talk about `MonadK`, what it is, how it works, and what it can be used for.
 We'll also look at another typeclass, more powerful than anything we've seen 
-so far. In exchange for such power, we must pay a price, the higher the price, 
-the more powerful the typeclass becomes.
+so far. In exchange for such power, we must pay a price.
+* **Sealed traits typeclass derivation:** Deriving typeclasses for sealed 
+traits is tricky, but it can be done. It involves a lot of prior work to get
+a good handle on though, so I'm saving it for last.
+* **Pros and cons of HKD**: Ok, by this time we've probably gone over a ton of
+stuff about HKD, so it's probably time then to talk more generally about the 
+idea, it's good parts, and it's bad parts. Why should you not use HKD?
 
 ### Playing around with stuff
 If you want to play around with HKD a bit more, I have extracted a lot of my 
